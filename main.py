@@ -1,10 +1,19 @@
 
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import TclError, messagebox
 from pathlib import Path
 from datetime import datetime
 import webbrowser
+import hashlib
 import html
+import re
+import sys
+import os
+import json
+import subprocess
+import tempfile
+import threading
+import urllib.request
 
 # ==========================================
 # CONFIGURACIÓN GENERAL
@@ -14,9 +23,23 @@ ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
 APP_NAME = "FormuDesk"
+VERSION = "1.0.0"
+GITHUB_USER = "EdwinFigueroa2003"
+GITHUB_REPO = "FormuDesk"
+GITHUB_API = (
+    f"https://api.github.com/repos/"
+    f"{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-GENERATED_DIR = BASE_DIR / "generated"
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+RESOURCE_DIR = Path(
+    getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+)
+GENERATED_DIR = APP_DIR / "generated"
 
 GENERATED_DIR.mkdir(exist_ok=True)
 
@@ -35,6 +58,11 @@ class FormuDeskApp(ctk.CTk):
         self.minsize(650, 550)
 
         self.crear_interfaz()
+
+        self.after(
+            1500,
+            lambda: verificar_actualizaciones(self)
+        )
 
     # ======================================
     # INTERFAZ GRÁFICA
@@ -204,7 +232,7 @@ class FormuDeskApp(ctk.CTk):
         fecha = html.escape(datos["fecha"])
         descripcion = html.escape(datos["descripcion"])
 
-        plantilla = (BASE_DIR / "templates" / "plantilla.html").read_text(
+        plantilla = (RESOURCE_DIR / "templates" / "plantilla.html").read_text(
             encoding="utf-8"
         )
         contenido_html = (
@@ -253,6 +281,278 @@ class FormuDeskApp(ctk.CTk):
 
         self.descripcion.delete("1.0", "end")
 
+
+# ==========================================
+# CONFIGURACIÓN DE ACTUALIZACIONES
+# ==========================================
+
+def version_tuple(version):
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version.strip())
+    if not match:
+        raise ValueError(
+            f"Versión no válida: {version}. Usa el formato v1.2.3."
+        )
+    return tuple(int(part) for part in match.groups())
+
+
+def consultar_ultima_version():
+    request = urllib.request.Request(
+        GITHUB_API,
+        headers={
+            "User-Agent": APP_NAME,
+            "Accept": "application/vnd.github+json"
+        }
+    )
+
+    with urllib.request.urlopen(request, timeout=10) as response:
+        release = json.loads(response.read().decode("utf-8"))
+
+    nueva_version = release.get("tag_name")
+    if not isinstance(nueva_version, str) or not nueva_version:
+        raise ValueError("GitHub no proporcionó la versión del release.")
+
+    if version_tuple(nueva_version) <= version_tuple(VERSION):
+        return None
+
+    asset = next(
+        (
+            item for item in release.get("assets", [])
+            if item.get("name") == "FormuDesk.exe"
+        ),
+        None
+    )
+    if asset is None:
+        raise ValueError(
+            "No se encontró FormuDesk.exe en los archivos del release."
+        )
+
+    return nueva_version, asset
+
+
+def descargar_actualizacion(asset):
+    download_url = asset.get("browser_download_url")
+    if not isinstance(download_url, str) or not download_url.startswith("https://"):
+        raise ValueError("GitHub no proporcionó una URL HTTPS válida.")
+
+    digest = asset.get("digest", "")
+    match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", digest)
+    if not match:
+        raise ValueError(
+            "El release no contiene un SHA-256 válido para verificar."
+        )
+
+    descriptor, nombre_temporal = tempfile.mkstemp(
+        prefix="FormuDesk_update_",
+        suffix=".exe"
+    )
+    os.close(descriptor)
+    ruta_temporal = Path(nombre_temporal)
+
+    try:
+        request = urllib.request.Request(
+            download_url,
+            headers={"User-Agent": APP_NAME}
+        )
+        sha256 = hashlib.sha256()
+
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with ruta_temporal.open("wb") as archivo:
+                while True:
+                    bloque = response.read(1024 * 1024)
+                    if not bloque:
+                        break
+                    archivo.write(bloque)
+                    sha256.update(bloque)
+
+        if sha256.hexdigest().lower() != match.group(1).lower():
+            raise ValueError("La verificación SHA-256 de la descarga falló.")
+
+        return ruta_temporal
+    except Exception:
+        try:
+            ruta_temporal.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def powershell_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def iniciar_reemplazo(app, actualizacion):
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "La actualización automática solo funciona en la versión EXE."
+        )
+
+    ruta_app = Path(sys.executable).resolve()
+    pid = os.getpid()
+    ruta_script = Path(tempfile.gettempdir()) / (
+        f"FormuDesk_update_{pid}.ps1"
+    )
+
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$targetProcessId = {pid}
+$target = {powershell_quote(ruta_app)}
+$newFile = {powershell_quote(actualizacion)}
+$staged = $target + '.new'
+$backup = $target + '.bak'
+$scriptPath = $MyInvocation.MyCommand.Path
+
+try {{
+    Wait-Process -Id $targetProcessId -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $newFile -Destination $staged -Force
+
+    if (Test-Path -LiteralPath $backup) {{
+        Remove-Item -LiteralPath $backup -Force
+    }}
+
+    Move-Item -LiteralPath $target -Destination $backup -Force
+
+    try {{
+        Move-Item -LiteralPath $staged -Destination $target -Force
+        Start-Process -FilePath $target
+    }}
+    catch {{
+        if (Test-Path -LiteralPath $target) {{
+            Remove-Item -LiteralPath $target -Force
+        }}
+        if (Test-Path -LiteralPath $backup) {{
+            Move-Item -LiteralPath $backup -Destination $target -Force
+        }}
+        throw
+    }}
+
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+}}
+catch {{
+    Add-Type -AssemblyName PresentationFramework
+    [System.Windows.MessageBox]::Show(
+        "No se pudo instalar la actualización: $($_.Exception.Message)",
+        "FormuDesk - Error"
+    )
+}}
+finally {{
+    Remove-Item -LiteralPath $newFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+}}
+"""
+
+    try:
+        ruta_script.write_text(script, encoding="utf-8-sig")
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", str(ruta_script)
+            ],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    except Exception:
+        if ruta_script.exists():
+            ruta_script.unlink()
+        if actualizacion.exists():
+            actualizacion.unlink()
+        raise
+
+    app.destroy()
+
+
+def programar_en_interfaz(app, callback):
+    try:
+        app.after(0, callback)
+    except (RuntimeError, TclError):
+        return False
+    return True
+
+
+def mostrar_error_actualizacion(app, error):
+    if app.winfo_exists():
+        messagebox.showwarning(
+            "Actualización",
+            f"No fue posible actualizar FormuDesk.\n\nDetalle: {error}",
+            parent=app
+        )
+
+
+def confirmar_actualizacion(app, nueva_version, asset):
+    if not app.winfo_exists():
+        return
+
+    respuesta = messagebox.askyesno(
+        "Actualización disponible",
+        f"Hay una nueva versión de FormuDesk: {nueva_version}\n\n"
+        f"Versión instalada: {VERSION}\n\n"
+        "¿Deseas descargarla e instalarla?",
+        parent=app
+    )
+    if not respuesta:
+        return
+
+    threading.Thread(
+        target=descargar_e_instalar,
+        args=(app, asset),
+        daemon=True
+    ).start()
+
+
+def descargar_e_instalar(app, asset):
+    actualizacion = None
+    try:
+        actualizacion = descargar_actualizacion(asset)
+        if not programar_en_interfaz(
+            app,
+            lambda: iniciar_actualizacion_desde_interfaz(app, actualizacion)
+        ):
+            actualizacion.unlink()
+    except Exception as error:
+        if actualizacion is not None and actualizacion.exists():
+            try:
+                actualizacion.unlink()
+            except OSError:
+                pass
+        programar_en_interfaz(
+            app,
+            lambda error=error: mostrar_error_actualizacion(app, error)
+        )
+
+
+def iniciar_actualizacion_desde_interfaz(app, actualizacion):
+    try:
+        iniciar_reemplazo(app, actualizacion)
+    except Exception as error:
+        mostrar_error_actualizacion(app, error)
+
+
+def verificar_actualizaciones(app):
+    if not getattr(sys, "frozen", False):
+        return
+
+    def consultar_en_segundo_plano():
+        try:
+            resultado = consultar_ultima_version()
+            if resultado is None:
+                return
+
+            nueva_version, asset = resultado
+            programar_en_interfaz(
+                app,
+                lambda: confirmar_actualizacion(app, nueva_version, asset)
+            )
+        except Exception as error:
+            programar_en_interfaz(
+                app,
+                lambda error=error: mostrar_error_actualizacion(app, error)
+            )
+
+    threading.Thread(
+        target=consultar_en_segundo_plano,
+        daemon=True
+    ).start()
 
 # ==========================================
 # EJECUCIÓN DEL PROGRAMA
