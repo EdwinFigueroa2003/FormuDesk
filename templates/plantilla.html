@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Documento - FormuDesk</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            color: #222;
+        }
+
+        .documento {
+            max-width: 750px;
+            margin: auto;
+            padding: 30px;
+            border: 1px solid #ddd;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .campo {
+            margin-bottom: 25px;
+        }
+
+        .campo strong {
+            display: block;
+            margin-bottom: 7px;
+        }
+
+        .descripcion {
+            white-space: pre-wrap;
+        }
+
+        @media print {
+            body {
+                margin: 0;
+            }
+
+            .documento {
+                border: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="documento">
+        <h1>DOCUMENTO</h1>
+        <div class="campo">
+            <strong>Nombre completo:</strong>
+            {{NOMBRE}}
+        </div>
+        <div class="campo">
+            <strong>Identificación:</strong>
+            {{IDENTIFICACION}}
+        </div>
+        <div class="campo">
+            <strong>Fecha:</strong>
+            {{FECHA}}
+        </div>
+        <div class="campo">
+            <strong>Descripción:</strong>
+            <div class="descripcion">{{DESCRIPCION}}</div>
+        </div>
+    </div>
+</body>
+</html>
